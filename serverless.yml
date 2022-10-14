@@ -1,0 +1,274 @@
+service: stepfunctiontut
+frameworkVersion: '3'
+configValidationMode: error
+
+provider:
+  name: aws
+  runtime: python3.8
+  region: ap-south-1
+  profile: second_user
+  iam:
+    role: IAMLambdaRoleExecution
+
+plugins:
+  - serverless-step-functions
+
+resources:
+  Resources:
+    OrdersQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        DelaySeconds: 0
+        QueueName: OrdersQueue
+    NotifyCourier:
+      Type: AWS::SNS::Topic
+      Properties:
+        Subscription:
+          - Endpoint: "" # Enter Your Gmail Here
+            Protocol: "email"
+        DisplayName: NotifyCourier
+        TopicName: NotifyCourier
+
+    StoreCheckoutFlow:
+      Type: AWS::StepFunctions::StateMachine
+      Properties:
+        Definition:
+          StartAt: checkInventory
+          States:
+            checkInventory:
+              Type: Task
+              Resource: "arn:aws:lambda:${aws:region}:${aws:accountId}:function:stepfunctiontut-dev-checkInventory"
+              Catch:
+                - ErrorEquals: [BookNotFoundError]
+                  Next: BookNotFoundError
+                - ErrorEquals: [BookOutOfStockError]
+                  Next: BookOutOfStockError
+              ResultPath: "$.book_details"
+              Next: calculateTotal
+            calculateTotal:
+              Type: Task
+              Resource: "arn:aws:lambda:${aws:region}:${aws:accountId}:function:stepfunctiontut-dev-calculateTotal"
+              ResultPath: "$.total_price"
+              Next: isRedeemNeeded
+            isRedeemNeeded:
+              Type: Choice
+              Choices:
+                - Variable: "$.redeem"
+                  BooleanEquals: true
+                  Next: RedeemPoints
+              Default: BillCustomer
+            RedeemPoints:
+              Type: Task
+              Resource: "arn:aws:lambda:${aws:region}:${aws:accountId}:function:stepfunctiontut-dev-RedeemPoints"
+              ResultPath: "$.total_price"
+              Catch:
+                - ErrorEquals:
+                    - States.ALL
+                  Next:  RedeemPointsError
+              Next: BillCustomer
+            BillCustomer:
+              Type: Task
+              Resource: "arn:aws:lambda:${aws:region}:${aws:accountId}:function:stepfunctiontut-dev-BillCustomer"
+              ResultPath: "$.billingStatus"
+              Retry:
+                - ErrorEquals:
+                    - States.ALL
+                  MaxAttempts: 3
+              Catch:
+                - ErrorEquals:
+                    - States.ALL
+                  ResultPath: "$.customerBilling"
+                  Next: BillingError
+              Next: PrepareOrder
+            PrepareOrder:
+              Type: Task
+              Resource: arn:aws:states:::sqs:sendMessage.waitForTaskToken
+              Parameters:
+                QueueUrl: !Ref OrdersQueue
+                MessageBody:
+                  Input.$: "$"
+                  Token.$: "$$.Task.Token"
+              ResultPath: "$.courierStatus"
+              Catch:
+                - ErrorEquals:
+                    - NoCourierAvailable
+                  ResultPath: "$.courierError"
+                  Next: RefundCustomer
+              Next: DispatchOrder
+            RestoreQuantity:
+              Type: Task
+              Resource: "arn:aws:lambda:${aws:region}:${aws:accountId}:function:stepfunctiontut-dev-RestoreQuantity"
+              ResultPath: "$.quantityRestoreStatus"
+              Next: RestoreRedeemPoints
+            RefundCustomer:
+              Type: Pass
+              Result: "Customer is refunded"
+              ResultPath: "$.refundStatus"
+              Next: RestoreQuantity
+            DispatchOrder:
+              Type: Task
+              Resource: arn:aws:states:::sns:publish
+              Parameters:
+                TopicArn: !Ref NotifyCourier
+                Message.$: "$"
+              Next: Dispatched
+            Dispatched:
+              Type: Pass
+              Result: "Your order will be dispatched within 24 hours"
+              End: true
+            BookNotFoundError:
+              Type: Pass
+              Result: "Not such book exists⚠️"
+              End: true
+            BookOutOfStockError:
+              Type: Pass
+              Result: "Sorry but the book is out of stock"
+              End: true
+            RedeemPointsError:
+              Type: Pass
+              Result: "Error while Redeeming points"
+              End: true
+            BillingError:
+              Type: Pass
+              Result: "Billing Error"
+              ResultPath: "$.billingStatus"
+              Next: RestoreRedeemPoints
+            RestoreRedeemPoints:
+              Type: Task
+              Resource: "arn:aws:lambda:${aws:region}:${aws:accountId}:function:stepfunctiontut-dev-RestoreRedeemPoints"
+              End: true
+        StateMachineName: StoreCheckoutFlow
+        RoleArn:
+          Fn::GetAtt: [IAMStoreCheckoutSf, Arn]
+
+
+    IAMLambdaRoleExecution:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: iam_lambda_role_execution
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: dynamodb:*
+                  Resource: arn:aws:dynamodb:ap-south-1:685751078596:table/bookTable
+                - Effect: Allow
+                  Action: dynamodb:*
+                  Resource: arn:aws:dynamodb:ap-south-1:685751078596:table/userTable
+                - Effect: Allow
+                  Action: sns:*
+                  Resource: arn:aws:sns:${aws:region}:${aws:accountId}:NotifyCourier
+                - Effect: Allow
+                  Action: sqs:*
+                  Resource: arn:aws:sqs:${aws:region}:${aws:accountId}:OrdersQueue
+                - Effect: Allow
+                  Action: states:*
+                  Resource: arn:aws:states:${aws:region}:${aws:accountId}:stateMachine:storeCheckoutFlow
+        RoleName: iam_lambda_role_execution
+    IAMStoreCheckoutFnCronSf:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - events.amazonaws.com
+              Action: sts:AssumeRole
+        Description: This role will allow the rule to trigger the step function every 5 min
+        Policies:
+          - PolicyName: iam_store_checkout_fn_cron_sf_policy
+            PolicyDocument:
+                  Version: "2012-10-17"
+                  Statement:
+                    - Effect: Allow
+                      Action: 'states:StartExecution'
+                      Resource:
+                        Fn::GetAtt: [StoreCheckoutFlow, Arn]
+        RoleName: iam_store_checkout_fn_cron_sf
+    IAMStoreCheckoutSf:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - states.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: iam_store_checkout_sf_policy
+            PolicyDocument:
+                  Version: "2012-10-17"
+                  Statement:
+                    - Effect: Allow
+                      Action: 'lambda:InvokeFunction'
+                      Resource: "arn:aws:lambda:${aws:region}:${aws:accountId}:function:stepfunctiontut-dev-RestoreRedeemPoints"
+                    - Effect: Allow
+                      Action: 'lambda:InvokeFunction'
+                      Resource: "arn:aws:lambda:${aws:region}:${aws:accountId}:function:stepfunctiontut-dev-RestoreQuantity"
+                    - Effect: Allow
+                      Action: 'lambda:InvokeFunction'
+                      Resource: "arn:aws:lambda:${aws:region}:${aws:accountId}:function:stepfunctiontut-dev-BillCustomer"
+                    - Effect: Allow
+                      Action: 'lambda:InvokeFunction'
+                      Resource:  "arn:aws:lambda:${aws:region}:${aws:accountId}:function:stepfunctiontut-dev-RedeemPoints"
+                    - Effect: Allow
+                      Action: 'lambda:InvokeFunction'
+                      Resource: "arn:aws:lambda:${aws:region}:${aws:accountId}:function:stepfunctiontut-dev-calculateTotal"
+                    - Effect: Allow
+                      Action: 'lambda:InvokeFunction'
+                      Resource: "arn:aws:lambda:${aws:region}:${aws:accountId}:function:stepfunctiontut-dev-checkInventory"
+
+        RoleName: iam_store_checkout_sf
+
+
+    StoreCheckoutFnCronSf:
+      Type: AWS::Events::Rule
+      Properties:
+        Description: This job will run the step function every two days
+        Name: store_checkout_fn_cron_sf
+        ScheduleExpression: "rate(5 minutes)"
+        State: "ENABLED"
+        Targets:
+          - Arn: !GetAtt StoreCheckoutFlow.Arn
+            Id: "TargetCalc"
+            RoleArn:
+              Fn::GetAtt: [IAMStoreCheckoutFnCronSf, Arn]
+
+
+
+functions:
+  checkInventory:
+    handler: handler.checkInventory
+  calculateTotal:
+    handler: handler.calculateTotal
+  redeemPoints:
+    handler: handler.redeemPoints
+  billCustomer:
+    handler: handler.billCustomer
+  restoreRedeemPoints:
+    handler: handler.restoreRedeemPoints
+  restoreQuantity:
+    handler: handler.restoreQuantity
+  sqsWorker:
+    handler: handler.sqsWorker
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - OrdersQueue
+              - Arn
+          batchSize: 1
+
